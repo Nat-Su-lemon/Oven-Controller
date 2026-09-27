@@ -23,8 +23,8 @@ cure-oven/
 
 1. Open `firmware/cure_controller/cure_controller.ino` in the Arduino IDE.
 2. Select the **Arduino Uno R4** board you have (Minima or WiFi).
-3. In Library Manager, install **Adafruit ST7735 and ST7789 Library** and accept its
-   dependencies (Adafruit GFX, Adafruit BusIO).
+3. In Library Manager, install **Adafruit ILI9341** and accept its dependencies
+   (Adafruit GFX, Adafruit BusIO).
 4. Upload.
 
 ### GUI from source
@@ -71,8 +71,13 @@ The apps are not code-signed, so the first launch shows a warning:
 |---|---|
 | Thermistor divider output | A0 |
 | Heater relay | D2 (HIGH = heater on) |
-| TFT (ST7789, 240x320) | CS D10, DC D9, RST D8, plus SPI (D11 MOSI, D13 SCK) |
+| TFT (ILI9341, 240x320, SPI) | CS D10, DC D9, RST D8, MOSI D11, SCK D13, MISO D12 (optional), plus VCC, GND and LED/backlight |
 | Serial link to computer | **Serial1: D0 (RX), D1 (TX), 115200 baud** |
+
+**Screen logic level:** the Uno R4's pins are 5 V. Adafruit's ILI9341 breakouts
+have level shifting built in, but most generic ILI9341 modules (the red 2.4" to 3.2"
+boards) are **3.3 V logic** and need a level shifter (or series resistors) on CS, DC,
+RST, MOSI and SCK. If the image is upside down, change `tft.setRotation(3)` to `1`.
 
 Nothing is sent over the R4's USB-C port; it is only used for uploading. Connect the
 computer through a **5 V USB-to-TTL adapter**:
@@ -380,10 +385,11 @@ see INFO/PARAMS/DATA lines within a second or two.
 | Title redrawn every second. | Title drawn with the profile; screen redrawn on START, GOTO and parameter changes (this clears the red trace). |
 | State field showed the phase name. | Also shows **FAULT** (red) and **PAUSED** (yellow); temperature shows **ERR** when the reading is invalid. |
 | Red trace drawn always. | Drawn only while a cure is running and the reading is valid. |
+| ST7789 display (`Adafruit_ST7789`, `tft.init(240, 320)`, `ST77XX_` colors). | ILI9341 display (`Adafruit_ILI9341`, `tft.begin()`, `ILI9341_` colors). Same 320x240 landscape layout and pins. |
 
 ### Unchanged
 
-Pins, TFT model and rotation, thermistor constants and conversion formula (including
+Pins, screen resolution and rotation, thermistor constants and conversion formula (including
 the 5.0 V vs 5.061 V note above), default Toray 3960 profile values, hysteresis
 control logic, 1 s control period, and 115200 baud.
 
