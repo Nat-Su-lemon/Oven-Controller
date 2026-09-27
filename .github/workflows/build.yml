@@ -1,0 +1,36 @@
+# Builds the Windows .exe and macOS .app on GitHub's machines.
+# Push this folder to a GitHub repo, then Actions > Build apps > Run workflow.
+# Download the results from the run's "Artifacts" section.
+name: Build apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: CureOven-Windows
+            path: dist/CureOven.exe
+          - os: macos-latest          # Apple Silicon
+            artifact: CureOven-macOS-arm64
+            path: dist/CureOven-macOS.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - run: pyinstaller --noconfirm --clean CureOven.spec
+      - if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/CureOven.app dist/CureOven-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}

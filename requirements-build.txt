@@ -1,0 +1,2 @@
+# Extra dependency needed only to build the standalone app (.exe / .app)
+pyinstaller>=6.0
