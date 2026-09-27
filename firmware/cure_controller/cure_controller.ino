@@ -33,7 +33,7 @@
 */
 
 #include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#include <Adafruit_ILI9341.h>
 #include <SPI.h>
 #include <EEPROM.h>
 #include <Arduino.h>
@@ -50,7 +50,7 @@
 #define TFT_CS    10
 #define TFT_RST   8
 #define TFT_DC    9
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);   // 240x320 ILI9341
 
 const int thermistorPin = A0;
 const int relayPin = 2;
@@ -306,8 +306,8 @@ int tempToY(float t) {
 }
 
 void drawProfile() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_WHITE);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(2);
   tft.setCursor(10, 5);
   tft.print(F("Cure Cycle"));
@@ -322,20 +322,20 @@ void drawProfile() {
   int y2 = tempToY(P.hold1Temp);
   int y3 = tempToY(P.hold2Temp);
 
-  tft.drawLine(x1, y1, x2, y2, ST77XX_WHITE);
-  tft.drawLine(x2, y2, x3, y2, ST77XX_WHITE);
-  tft.drawLine(x3, y2, x4, y3, ST77XX_WHITE);
-  tft.drawLine(x4, y3, x5, y3, ST77XX_WHITE);
+  tft.drawLine(x1, y1, x2, y2, ILI9341_WHITE);
+  tft.drawLine(x2, y2, x3, y2, ILI9341_WHITE);
+  tft.drawLine(x3, y2, x4, y3, ILI9341_WHITE);
+  tft.drawLine(x4, y3, x5, y3, ILI9341_WHITE);
 }
 
 void drawScreen() {
   if (running && tempValid(currentTemp)) {
-    tft.drawPixel(timeToX(cycleMs / 1000.0), tempToY(currentTemp), ST77XX_RED);
+    tft.drawPixel(timeToX(cycleMs / 1000.0), tempToY(currentTemp), ILI9341_RED);
   }
 
   tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.fillRect(205, 125, 115, 100, ST77XX_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.fillRect(205, 125, 115, 100, ILI9341_BLACK);
 
   tft.setCursor(125, 125); tft.print(F("Temp:"));
   tft.setCursor(205, 125);
@@ -349,8 +349,8 @@ void drawScreen() {
 
   tft.setCursor(125, 200); tft.print(F("State:"));
   tft.setCursor(205, 200);
-  if (faulted)      { tft.setTextColor(ST77XX_RED);    tft.print(F("FAULT")); }
-  else if (paused)  { tft.setTextColor(ST77XX_YELLOW); tft.print(F("PAUSED")); }
+  if (faulted)      { tft.setTextColor(ILI9341_RED);    tft.print(F("FAULT")); }
+  else if (paused)  { tft.setTextColor(ILI9341_YELLOW); tft.print(F("PAUSED")); }
   else              { tft.print(STATE_NAMES[phase]); }
 }
 
@@ -648,8 +648,8 @@ void setup() {
   Serial1.begin(115200);
   Serial1.println(F("INFO cure controller boot"));
 
-  tft.init(240, 320);
-  tft.setRotation(3);
+  tft.begin();
+  tft.setRotation(3);                // landscape 320x240; use 1 if the image is upside down
 
   bool resume = loadFromEeprom();
   currentTemp = readTemperature();
