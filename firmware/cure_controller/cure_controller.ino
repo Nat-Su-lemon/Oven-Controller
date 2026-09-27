@@ -23,8 +23,8 @@
     PARAMS / STATUS     print parameters / print one DATA line now
 
   Cure progress and parameters are saved to EEPROM, so if the board resets
-  mid-cure (power blip, or a computer opening the serial port, which resets
-  an Uno) it resumes where it left off instead of restarting.
+  mid-cure (power blip, brownout, reset button) it resumes where it left off
+  instead of restarting. See README.md for full behavior and fault handling.
 
   Toray 3960:
     Ramp ~25C -> 120C at ~2.5 C/min, hold 120C for 240 min
@@ -412,15 +412,17 @@ void raiseFault(const __FlashStringHelper* reason) {
   }
 }
 
-void startRun(float atMin) {
+// Returns false (and changes nothing) if the start temperature can't be read.
+bool startRun(float atMin) {
   float t = readTemperature();
   if (atMin <= 0 || !running) {
     if (!tempValid(t)) {
       Serial1.println(F("ERR cannot start: thermistor reading invalid"));
-      return;
+      return false;
     }
     startTemp = t;
   }
+  phase = IDLE;   // so the next update reports the phase we land in
   running = true;
   paused = false;
   faulted = false;
@@ -437,6 +439,7 @@ void startRun(float atMin) {
   Serial1.println(startTemp, 2);
   printParams();
   drawProfile();
+  return true;
 }
 
 void finishRun() {
@@ -573,18 +576,17 @@ void handleCommand(char* line) {
   } else if (strcasecmp(cmd, "PARAMS") == 0) {
     printParams();
   } else if (strcasecmp(cmd, "START") == 0) {
-    phase = IDLE;
-    startRun(0);
-    Serial1.println(F("OK start"));
+    if (startRun(0)) Serial1.println(F("OK start"));
   } else if (strcasecmp(cmd, "GOTO") == 0) {
     float m;
     if (!parseFloat(arg1, m) || m < 0 || m * 60.0 > totalS()) {
       Serial1.println(F("ERR usage: GOTO <minutes>, within the cycle length"));
       return;
     }
-    startRun(m);
-    Serial1.print(F("OK goto "));
-    Serial1.println(m, 2);
+    if (startRun(m)) {
+      Serial1.print(F("OK goto "));
+      Serial1.println(m, 2);
+    }
   } else if (strcasecmp(cmd, "PAUSE") == 0) {
     if (!running) { Serial1.println(F("ERR not running")); return; }
     paused = true;
