@@ -197,9 +197,17 @@ The rise watchdog applies during ramps, holds and PAUSE. A normal thermostat-off
 reading resets it. Brief invalid readings turn the heater off but retain the
 accumulated exposure, so intermittent sensor faults cannot repeatedly restart the
 window. Falling or oscillating temperatures do not lower the rise baseline.
-`HEAT_RISE_TIMEOUT_MS` and `HEAT_MIN_RISE_C` in the sketch are initial thresholds;
-validate them with the slowest intended oven/load. Keep the simulator constants in
-sync if changing them (the tests check this).
+In the GUI's **Cure parameters** panel, edit **Watchdog timeout** (heater-on
+seconds) and **Watchdog min. rise** (°C), then click **Send**. The defaults are
+180 s and 2 °C; validate them with the slowest intended oven/load. Scroll the
+parameter list if needed. **Reload** reads the board's saved values; **Defaults**
+restores the watchdog defaults along with the cure defaults.
+
+Both settings are saved to EEPROM and apply on the next control tick. Changing
+them retains the current rise baseline and accumulated heater-on time; shortening
+the timeout can therefore fault immediately. Neither setting can be zero, and
+editing them does not clear an existing fault. Older saved cures and faults are
+preserved when upgrading: the added settings initially use the defaults.
 
 **Clearing a fault:**
 
@@ -244,7 +252,7 @@ with a tag.
 | Tag | When | Example |
 |---|---|---|
 | `DATA` | every second, and on STATUS | `DATA t=61.0 state=RAMP1 paused=0 fault=0 reason=none temp=25.10 set=26.44 err=1.34 heater=1 st=61 srem=2219 rem=25259 vac=0 adc=198.8 R=9961.9 up=64` |
-| `PARAMS` | at boot, on PARAMS, after SET, DEFAULTS, START, GOTO | `PARAMS ramp1=38.00 hold1temp=120.00 hold1=240.00 ramp2=24.00 hold2temp=180.00 hold2=120.00 hyst=2.00 maxtemp=200.00 start=23.41 total=422.00` |
+| `PARAMS` | at boot, on PARAMS, after SET, DEFAULTS, START, GOTO | `PARAMS ramp1=38.00 hold1temp=120.00 hold1=240.00 ramp2=24.00 hold2temp=180.00 hold2=120.00 hyst=2.00 maxtemp=200.00 heattimeout=180.00 heatrise=2.00 start=23.41 total=422.00` |
 | `EVENT` | something happened | `EVENT state from=RAMP1 to=HOLD1 t=2280.0` |
 | `OK` / `ERR` | reply to a command | `OK set hold1=250.00`, `ERR not running` |
 | `INFO` | boot messages, help, warnings | `INFO idle, send START to begin a cure` |
@@ -302,6 +310,12 @@ Parameters:
 | `hold2` | hold 2 time, min | 120 | 0 to 1440 |
 | `hyst` | hysteresis, ± °C | 2 | 0.1 to 20 |
 | `maxtemp` | over-temp cutoff, °C | 200 | 50 to 280 |
+| `heattimeout` | watchdog heater-on time without sufficient rise, **seconds** | 180 | 10 to 1800 |
+| `heatrise` | watchdog minimum temperature rise, °C | 2 | 0.1 to 20 |
+
+For example, `SET heattimeout 120` and `SET heatrise 1.5` require a 1.5 °C rise
+within 120 seconds of heater-on time. Upload the updated firmware before using
+these controls with a physical board.
 
 Things to know about changing parameters:
 

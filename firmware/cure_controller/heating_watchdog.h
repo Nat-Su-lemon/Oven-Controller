@@ -10,6 +10,13 @@ class HeatingWatchdog {
   HeatingWatchdog(uint32_t timeoutMs, float minRiseC)
       : timeoutMs_(timeoutMs), minRiseC_(minRiseC) {}
 
+  // Changing thresholds retains exposure and baseline; it does not grant a new
+  // heating window. A shorter timeout can fault on the next update.
+  void configure(uint32_t timeoutMs, float minRiseC) {
+    timeoutMs_ = timeoutMs;
+    minRiseC_ = minRiseC;
+  }
+
   void reset(uint32_t now) {
     active_ = wasHeating_ = false;
     onMs_ = 0;
@@ -42,8 +49,8 @@ class HeatingWatchdog {
   }
 
  private:
-  const uint32_t timeoutMs_;
-  const float minRiseC_;
+  uint32_t timeoutMs_;
+  float minRiseC_;
   bool active_ = false;
   bool wasHeating_ = false;
   uint32_t lastMs_ = 0;

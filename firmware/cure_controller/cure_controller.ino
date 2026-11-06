@@ -18,7 +18,7 @@
     PAUSE / RESUME      freeze / unfreeze the cycle clock (heater holds setpoint)
     ABORT               heater off, end the cure
     CLEAR               clear a latched fault
-    SET <name> <value>  change a parameter (times in min, temps in C)
+    SET <name> <value>  change a parameter (cycle times in min, heattimeout in s, temps in C)
     DEFAULTS            restore the Toray 3960 defaults
     PARAMS / STATUS     print parameters / print one DATA line now
 
@@ -74,11 +74,6 @@ const float SENSOR_MIN_C = -20.0;       // below this: thermistor open / unplugg
 const float SENSOR_MAX_C = 300.0;       // above this: thermistor shorted
 const uint8_t SENSOR_FAULT_COUNT = 3;   // consecutive bad reads before faulting
 const float VACUUM_SAFE_C = 65.0;
-// Initial thresholds: validate with the slowest expected oven/load. Applies to
-// ramps AND holds, including PAUSE (the heater still regulates while paused).
-const uint32_t HEAT_RISE_TIMEOUT_MS = 180000UL;
-const float HEAT_MIN_RISE_C = 2.0;
-HeatingWatchdog heatWatch(HEAT_RISE_TIMEOUT_MS, HEAT_MIN_RISE_C);
 
 // ---------------- Timing ----------------
 
@@ -101,6 +96,15 @@ struct Params {
 const Params DEFAULT_PARAMS = {38.0, 120.0, 240.0, 24.0, 180.0, 120.0, 2.0, 200.0};
 Params P = DEFAULT_PARAMS;
 
+// Stored separately to preserve the existing cure header and progress layout.
+struct WatchdogParams {
+  float timeoutS;
+  float minRiseC;
+};
+const WatchdogParams DEFAULT_WATCHDOG = {180.0, 2.0};
+WatchdogParams W = DEFAULT_WATCHDOG;
+HeatingWatchdog heatWatch((uint32_t)(W.timeoutS * 1000.0), W.minRiseC);
+
 struct ParamDef {
   const char* name;
   float* value;
@@ -117,6 +121,8 @@ const ParamDef PARAM_DEFS[] = {
   {"hold2",     &P.hold2Min,  0.0, 1440.0},
   {"hyst",      &P.hyst,      0.1, 20.0},
   {"maxtemp",   &P.maxTemp,   50.0, 280.0},
+  {"heattimeout", &W.timeoutS, 10.0, 1800.0},  // heater-on seconds
+  {"heatrise",    &W.minRiseC,  0.1, 20.0},    // minimum rise in C
 };
 const uint8_t NUM_PARAMS = sizeof(PARAM_DEFS) / sizeof(PARAM_DEFS[0]);
 
@@ -142,9 +148,16 @@ struct Progress {
 };
 
 const int HEADER_ADDR = 0;
+const int WATCHDOG_ADDR = 48;
 const int PROGRESS_ADDR = 64;
 const uint8_t PROGRESS_SLOTS = 32;
-static_assert(sizeof(Header) <= PROGRESS_ADDR, "Header overlaps progress slots");
+const uint32_t WATCHDOG_MAGIC = 0x57444731;
+struct WatchdogRecord {
+  uint32_t magic;
+  WatchdogParams p;
+};
+static_assert(sizeof(Header) <= WATCHDOG_ADDR, "Header overlaps watchdog settings");
+static_assert(WATCHDOG_ADDR + sizeof(WatchdogRecord) <= PROGRESS_ADDR, "Watchdog settings overlap progress slots");
 
 // ---------------- State ----------------
 
@@ -253,6 +266,11 @@ void printState() {
 
 // ---------------- EEPROM ----------------
 
+void saveWatchdogParams() {
+  WatchdogRecord record = {WATCHDOG_MAGIC, W};
+  EEPROM.put(WATCHDOG_ADDR, record);
+}
+
 void saveHeader() {
   Header h;
   h.magic = EEPROM_MAGIC;
@@ -260,6 +278,7 @@ void saveHeader() {
   h.runFlags = (running ? 1 : 0) | ((uint8_t)faultCode << 1);
   h.startTemp = startTemp;
   EEPROM.put(HEADER_ADDR, h);
+  saveWatchdogParams();
 }
 
 void saveProgress() {
@@ -276,6 +295,7 @@ bool loadFromEeprom() {
   if (h.magic != EEPROM_MAGIC) {
     Serial1.println(F("INFO EEPROM empty or old layout, loading defaults"));
     P = DEFAULT_PARAMS;
+    W = DEFAULT_WATCHDOG;
     running = false;
     Progress zero = {0, 0};
     for (uint8_t i = 0; i < PROGRESS_SLOTS; i++) {
@@ -287,6 +307,18 @@ bool loadFromEeprom() {
   }
 
   P = h.p;
+  WatchdogRecord record;
+  EEPROM.get(WATCHDOG_ADDR, record);
+  if (record.magic == WATCHDOG_MAGIC &&
+      isfinite(record.p.timeoutS) && record.p.timeoutS >= 10.0 && record.p.timeoutS <= 1800.0 &&
+      isfinite(record.p.minRiseC) && record.p.minRiseC >= 0.1 && record.p.minRiseC <= 20.0) {
+    W = record.p;
+  } else {
+    // Older firmware left this space unused. Keep the cure, progress and fault.
+    W = DEFAULT_WATCHDOG;
+    saveWatchdogParams();
+    Serial1.println(F("INFO loading default heating watchdog settings"));
+  }
   startTemp = h.startTemp;
   uint8_t savedFault = h.runFlags >> 1;
   faultCode = savedFault <= FAULT_NO_HEAT ? (FaultCode)savedFault : FAULT_SENSOR;
@@ -421,6 +453,7 @@ void printHelp() {
   Serial1.println(F("INFO commands: START | GOTO <min> | PAUSE | RESUME | ABORT | CLEAR"));
   Serial1.println(F("INFO           SET <name> <value> | DEFAULTS | PARAMS | STATUS | HELP"));
   Serial1.println(F("INFO params:   ramp1 hold1 ramp2 hold2 (min), hold1temp hold2temp hyst maxtemp (C)"));
+  Serial1.println(F("INFO           heattimeout (heater-on s), heatrise (C)"));
 }
 
 // ---------------- Run control ----------------
@@ -546,6 +579,7 @@ void controlStep() {
   }
 
   if (running && !faulted && phase != COMPLETE) {
+    heatWatch.configure((uint32_t)(W.timeoutS * 1000.0), W.minRiseC);
     // A valid, satisfied thermostat resets the window. Invalid reads turn the
     // heater off above, but retain the exposure count if heating later resumes.
     bool satisfied = tempValid(currentTemp) && !heaterOn;
@@ -668,6 +702,7 @@ void handleCommand(char* line) {
     setParam(arg1, arg2);
   } else if (strcasecmp(cmd, "DEFAULTS") == 0) {
     P = DEFAULT_PARAMS;
+    W = DEFAULT_WATCHDOG;
     saveHeader();
     Serial1.println(F("OK defaults"));
     printParams();

@@ -120,16 +120,94 @@ class SimulatorSafetyTests(unittest.TestCase):
     def test_constants_match_sketch(self):
         source = (Path(__file__).resolve().parents[1] / "firmware/cure_controller/cure_controller.ino").read_text()
         for name, value in [("A", gui.THERMISTOR_A), ("B", gui.THERMISTOR_B), ("C", gui.THERMISTOR_C),
-                            ("R2", gui.DIVIDER_R), ("HEAT_MIN_RISE_C", gui.HEAT_MIN_RISE_C),
-                            ("HEAT_RISE_TIMEOUT_MS", gui.HEAT_RISE_TIMEOUT_S * 1000)]:
+                            ("R2", gui.DIVIDER_R)]:
             match = re.search(rf"const (?:float|uint32_t) {name} = ([\d.]+)", source)
             self.assertIsNotNone(match, name)
             self.assertEqual(float(match[1]), value, name)
-        for name, low, high in re.findall(r'\{"(\w+)",\s*&P\.\w+,\s*([\d.]+),\s*([\d.]+)\}', source):
+        limits = re.findall(r'\{"(\w+)",\s*&[PW]\.\w+,\s*([\d.]+),\s*([\d.]+)\}', source)
+        self.assertEqual(len(limits), len(gui.PARAMS))
+        for name, low, high in limits:
             self.assertEqual(gui.PARAM_LIMITS[name], (float(low), float(high)))
+        defaults = re.search(r'DEFAULT_WATCHDOG = \{([\d.]+), ([\d.]+)\}', source)
+        self.assertEqual(float(defaults[1]), gui.DEFAULTS["heattimeout"])
+        self.assertEqual(float(defaults[2]), gui.DEFAULTS["heatrise"])
+
+    def test_adjustable_watchdog_timeout_and_defaults(self):
+        self.sim.write_line("SET heattimeout 30")
+        self.sim.write_line("SET heatrise 1.5")
+        self.sim.write_line("PARAMS")
+        _, fields = gui.parse_line(self.drain()[-1])
+        self.assertEqual(float(fields["heattimeout"]), 30)
+        self.assertEqual(float(fields["heatrise"]), 1.5)
+        self.sim.write_line("GOTO 38")
+        self.step(20)
+        self.assertFalse(self.sim.fault)
+        self.sim.write_line("SET heattimeout 10")
+        self.step(1)
+        self.assertEqual(self.sim.fault_reason, "no_heat")
+        self.sim.write_line("SET heatrise 3")
+        self.assertTrue(self.sim.fault)
+        self.sim.write_line("DEFAULTS")
+        self.assertEqual(self.sim.p, gui.DEFAULTS)
+        self.assertTrue(self.sim.fault)
+
+    def test_watchdog_rise_setting_changes_required_progress(self):
+        for required_rise, should_fault in [(1.0, False), (3.0, True)]:
+            with self.subTest(required_rise=required_rise):
+                self.setUp()
+                self.sim.write_line("SET heattimeout 10")
+                self.sim.write_line(f"SET heatrise {required_rise}")
+                self.sim.write_line("GOTO 38")
+                self.step(1)
+                self.sim._read_sensor = lambda: 27.0
+                self.step(10)
+                self.assertEqual(self.sim.fault, should_fault)
+
+    def test_invalid_watchdog_values_are_rejected(self):
+        for command in ["SET heattimeout 0", "SET heattimeout 1801", "SET heattimeout nan",
+                        "SET heatrise 0", "SET heatrise 21", "SET heatrise inf"]:
+            self.sim.write_line(command)
+            self.assertTrue(self.drain()[-1].startswith("ERR"), command)
+        self.assertEqual(self.sim.p, gui.DEFAULTS)
 
 
 class FaultBannerTests(unittest.TestCase):
+    def test_gui_reload_edit_and_send_watchdog_settings(self):
+        class Value:
+            def __init__(self, value):
+                self.value = str(value)
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = str(value)
+
+        app = gui.CureGUI.__new__(gui.CureGUI)
+        app.params = dict(gui.DEFAULTS)
+        app.loaded_params = dict(gui.DEFAULTS)
+        app.param_vars = {k: Value(v) for k, v in gui.DEFAULTS.items()}
+        app.param_entries = {k: Mock() for k in gui.DEFAULTS}
+        app.param_hint = Mock()
+        app.start_temp = 25.0
+        app.send = Mock()
+        app._is_curing = lambda: False
+        app._on_params({"heattimeout": "45.00", "heatrise": "1.50"})
+        self.assertEqual(app.param_vars["heattimeout"].get(), "45")
+        self.assertEqual(app.param_vars["heatrise"].get(), "1.5")
+        self.assertEqual(app.loaded_params["heattimeout"], 45)
+        app.param_vars["heattimeout"].set("60")
+        app.param_vars["heatrise"].set("2.5")
+        app.cmd_send_params()
+        self.assertEqual([call.args[0] for call in app.send.call_args_list],
+                         ["SET heattimeout 60", "SET heatrise 2.5"])
+        app.send.reset_mock()
+        app.param_vars["heattimeout"].set("0")
+        with patch.object(gui.messagebox, "showerror") as error:
+            app.cmd_send_params()
+        error.assert_called_once()
+        app.send.assert_not_called()
+
     def test_reconnect_recovers_reason_from_data_without_event(self):
         app = gui.CureGUI.__new__(gui.CureGUI)
         app.fault_reason = ""

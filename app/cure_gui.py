@@ -53,23 +53,25 @@ PARAMS = [
     ("hold2", "Hold 2 time", "min"),
     ("hyst", "Hysteresis (±)", "°C"),
     ("maxtemp", "Over-temp cutoff", "°C"),
+    ("heattimeout", "Watchdog timeout", "s"),
+    ("heatrise", "Watchdog min. rise", "°C"),
 ]
 DEFAULTS = {
     "ramp1": 38.0, "hold1temp": 120.0, "hold1": 240.0, "ramp2": 24.0,
     "hold2temp": 180.0, "hold2": 120.0, "hyst": 2.0, "maxtemp": 200.0,
+    "heattimeout": 180.0, "heatrise": 2.0,
 }
 PARAM_LIMITS = {
     "ramp1": (0.0, 1440.0), "hold1temp": (0.0, 250.0), "hold1": (0.0, 1440.0),
     "ramp2": (0.0, 1440.0), "hold2temp": (0.0, 250.0), "hold2": (0.0, 1440.0),
     "hyst": (0.1, 20.0), "maxtemp": (50.0, 280.0),
+    "heattimeout": (10.0, 1800.0), "heatrise": (0.1, 20.0),
 }
 # Match cure_controller.ino: B57550G1103F000, curve 8307, 2402 ohm divider.
 THERMISTOR_A = 0.000855501331
 THERMISTOR_B = 0.000259624005
 THERMISTOR_C = 0.000000137319048
 DIVIDER_R = 2402.0
-HEAT_RISE_TIMEOUT_S = 180.0
-HEAT_MIN_RISE_C = 2.0
 FAULT_HINTS = {
     "sensor": "Check thermistor wiring and the A2 divider.",
     "overtemp": "Above over-temp cutoff. Let the oven cool before clearing.",
@@ -318,10 +320,10 @@ class SimLink:
                 self.watch_baseline = self.temp
                 self.watch_on_s = 0.0
         else:
-            if self._temp_valid(self.temp) and self.temp >= self.watch_baseline + HEAT_MIN_RISE_C:
+            if self._temp_valid(self.temp) and self.temp >= self.watch_baseline + self.p["heatrise"]:
                 self.watch_baseline = self.temp
                 self.watch_on_s = 0.0
-            if self.watch_on_s >= HEAT_RISE_TIMEOUT_S:
+            if self.watch_on_s >= self.p["heattimeout"]:
                 self._raise_fault("no_heat")
 
     def _read_sensor(self):
@@ -395,6 +397,7 @@ class SimLink:
         elif cmd == "HELP":
             self._emit("INFO commands: START | GOTO <min> | PAUSE | RESUME | ABORT | CLEAR")
             self._emit("INFO           SET <name> <value> | DEFAULTS | PARAMS | STATUS | HELP")
+            self._emit("INFO params: ramp1 hold1 ramp2 hold2 (min), hold1temp hold2temp hyst maxtemp heatrise (C), heattimeout (s)")
         else:
             self._emit(f"ERR unknown command: {parts[0]}")
 
@@ -606,21 +609,42 @@ class CureGUI:
     def _build_params(self, parent):
         f = ttk.LabelFrame(parent, text="Cure parameters", padding=(10, 6))
         f.pack(fill="both", expand=True, pady=(6, 0))
+        # Keep all settings and the Send/Reload/Defaults buttons reachable on
+        # smaller screens, even while the fault banner is shown above them.
+        canvas = tk.Canvas(f, bg=BG, highlightthickness=0, height=240)
+        scrollbar = ttk.Scrollbar(f, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        rows = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        rows.columnconfigure(0, weight=1)
+        f.rowconfigure(0, weight=1)
         self.param_vars = {}
         self.param_entries = {}
         for i, (key, label, unit) in enumerate(PARAMS):
-            ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=1)
+            ttk.Label(rows, text=label).grid(row=i, column=0, sticky="w", pady=1)
             var = tk.StringVar(value=f"{DEFAULTS[key]:g}")
-            ent = tk.Entry(f, textvariable=var, width=8, justify="right", relief="solid", bd=1)
+            ent = tk.Entry(rows, textvariable=var, width=8, justify="right", relief="solid", bd=1)
             ent.grid(row=i, column=1, sticky="e", padx=4)
-            ttk.Label(f, text=unit, style="Muted.TLabel").grid(row=i, column=2, sticky="w")
+            ttk.Label(rows, text=unit, style="Muted.TLabel").grid(row=i, column=2, sticky="w")
             var.trace_add("write", lambda *_a: self._update_param_hints())
             self.param_vars[key] = var
             self.param_entries[key] = ent
+        def scroll_params(event):
+            direction = -1 if event.num == 4 or event.delta > 0 else 1
+            canvas.yview_scroll(direction, "units")
+            return "break"
+        for widget in [canvas, rows, *rows.winfo_children()]:
+            widget.bind("<MouseWheel>", scroll_params)
+            widget.bind("<Button-4>", scroll_params)
+            widget.bind("<Button-5>", scroll_params)
         self.param_hint = ttk.Label(f, text="", style="Muted.TLabel", justify="left", wraplength=300)
-        self.param_hint.grid(row=len(PARAMS) + 1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.param_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         bf = ttk.Frame(f)
-        bf.grid(row=len(PARAMS), column=0, columnspan=3, sticky="we", pady=(6, 0))
+        bf.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.param_buttons = [
             ttk.Button(bf, text="Send", command=self.cmd_send_params),
             ttk.Button(bf, text="Reload", command=lambda: self.send("PARAMS")),
@@ -1034,6 +1058,7 @@ class CureGUI:
             warn = "\nCutoff is too close to hold 2 temp!"
         self.param_hint.configure(
             text=f"Ramps {r1:.2f} / {r2:.2f} °C/min, total {fmt_duration(total * 60)}\n"
+                 f"Watchdog: rise {vals['heatrise']:g} °C per {vals['heattimeout']:g} s heater-on\n"
                  f"Yellow = edited, not sent yet{warn}")
         self.plot_dirty = True
 

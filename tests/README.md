@@ -26,5 +26,7 @@ These checks cover nominal thermistor table points, ADC rails, stuck-low reading
 invalid-sample shutdown, over-temperature, clock freezing, fault persistence,
 legacy EEPROM compatibility, explicit CLEAR, paused heating, watchdog renewal,
 intermittent faults, timer wrap, GUI reconnection/logging, parameter validation,
-and a complete simulated cure. They do not measure the physical oven's response;
+configurable watchdog validation/persistence, migration of older EEPROM data,
+changes during heating without resetting exposure, and a complete simulated cure.
+They do not measure the physical oven's response;
 validate the 2 °C / 180 s thresholds and temperature calibration on the real load.

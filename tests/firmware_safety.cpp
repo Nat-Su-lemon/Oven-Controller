@@ -150,6 +150,69 @@ static void watchdogEdges() {
   watch.update(0, true, 25, false);
   watch.update(90000, true, 22, false);
   assert(watch.update(180000, true, 25, false));
+  watch.reset(0);
+  watch.update(0, true, 25, false);
+  watch.update(60000, true, 25, false);
+  watch.configure(60000, 2); // changing configuration retains elapsed exposure
+  assert(watch.update(61000, true, 25, false));
+}
+
+static void adjustableWatchdog() {
+  fresh();
+  command("SET heattimeout 30");
+  command("SET heatrise 1.5");
+  assert(W.timeoutS == 30 && W.minRiseC == 1.5f);
+  printParams();
+  assert(Serial1.output.str().find("heattimeout=30") != std::string::npos);
+  assert(Serial1.output.str().find("heatrise=1.5") != std::string::npos);
+  W = DEFAULT_WATCHDOG;
+  setup();
+  assert(W.timeoutS == 30 && W.minRiseC == 1.5f); // persists across boot
+  command("SET heattimeout 0"); command("SET heatrise 0");
+  command("SET heattimeout nan"); command("SET heatrise inf");
+  command("SET heattimeout 1801"); command("SET heatrise 21");
+  assert(W.timeoutS == 30 && W.minRiseC == 1.5f);
+  assert(startRun(38));
+  seconds(20);
+  assert(!faulted);
+  command("SET heattimeout 10"); // no new window on parameter change
+  seconds(1);
+  assert(faulted && faultCode == FAULT_NO_HEAT && !relayOutput);
+  command("SET heatrise 3");
+  assert(faulted); // setting thresholds cannot clear a fault
+  command("DEFAULTS");
+  assert(W.timeoutS == 180 && W.minRiseC == 2 && faulted);
+
+  fresh();
+  command("SET ramp1 42");
+  assert(startRun(42));
+  seconds(5);
+  raiseFault(FAULT_SENSOR);
+  unsigned long frozen = cycleMs;
+  // Emulate firmware predating configurable watchdog settings: unused bytes.
+  for (int i = WATCHDOG_ADDR; i < PROGRESS_ADDR; ++i) EEPROM.bytes[i] = 0xff;
+  W = {30, 3};
+  faultCode = FAULT_NONE;
+  running = faulted = false;
+  setup();
+  assert(W.timeoutS == 180 && W.minRiseC == 2);
+  assert(P.ramp1Min == 42 && running && faulted && faultCode == FAULT_SENSOR);
+  assert(cycleMs == frozen && !relayOutput);
+  WatchdogRecord corrupt = {WATCHDOG_MAGIC, {NAN, 0}};
+  EEPROM.put(WATCHDOG_ADDR, corrupt);
+  setup();
+  assert(W.timeoutS == 180 && W.minRiseC == 2 && faulted);
+
+  for (int requiredRise = 1; requiredRise <= 3; requiredRise += 2) {
+    fresh();
+    command("SET heattimeout 10");
+    command(requiredRise == 1 ? "SET heatrise 1" : "SET heatrise 3");
+    assert(startRun(38));
+    seconds(1);
+    fakeAdc = 215; // about 27.5 C: enough for a 1 C rise, insufficient for 3 C
+    seconds(10);
+    assert(faulted == (requiredRise == 3));
+  }
 }
 
 int main() {
@@ -158,6 +221,7 @@ int main() {
   invalidSensorAndOvertemp();
   legacyAndRunningFaultRestore();
   watchdogEdges();
+  adjustableWatchdog();
   fresh();
   assert(startRun(38));
   command("PAUSE");
