@@ -37,6 +37,7 @@
 #include <SPI.h>
 #include <EEPROM.h>
 #include <Arduino.h>
+#include "heating_watchdog.h"
 
 // ---------------- Build options ----------------
 
@@ -52,15 +53,19 @@
 #define TFT_DC    9
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);   // 240x320 ILI9341
 
-const int thermistorPin = A0;
+
+
+const int thermistorPin = A2;
 const int relayPin = 2;
 
-// Thermistor (Steinhart-Hart)
-const float Vcc = 5.061;
-const float R2 = 2402;
-const float A = 0.00045421;
-const float B = 0.00035529;
-const float C = -0.00000027612;
+// B57550G1103F000: R25 = 10 kohm, R/T curve 8307 (B25/100 = 3492 K).
+// Steinhart-Hart fit to datasheet points at 25, 120 and 200 C, R in ohms.
+// Divider: 5 V -> NTC -> A2 -> R2 -> GND; ADC reference is the same 5 V rail.
+const float R2 = 2402.0;              // measured fixed resistor, not NTC R25
+const float A = 0.000855501331;
+const float B = 0.000259624005;
+const float C = 0.000000137319048;
+const float ADC_MAX = 1023.0;         // explicitly configured 10-bit ADC
 const uint8_t ADC_SAMPLES = 8;          // readings averaged per measurement
 
 // ---------------- Safety ----------------
@@ -69,6 +74,11 @@ const float SENSOR_MIN_C = -20.0;       // below this: thermistor open / unplugg
 const float SENSOR_MAX_C = 300.0;       // above this: thermistor shorted
 const uint8_t SENSOR_FAULT_COUNT = 3;   // consecutive bad reads before faulting
 const float VACUUM_SAFE_C = 65.0;
+// Initial thresholds: validate with the slowest expected oven/load. Applies to
+// ramps AND holds, including PAUSE (the heater still regulates while paused).
+const uint32_t HEAT_RISE_TIMEOUT_MS = 180000UL;
+const float HEAT_MIN_RISE_C = 2.0;
+HeatingWatchdog heatWatch(HEAT_RISE_TIMEOUT_MS, HEAT_MIN_RISE_C);
 
 // ---------------- Timing ----------------
 
@@ -116,10 +126,13 @@ const uint8_t NUM_PARAMS = sizeof(PARAM_DEFS) / sizeof(PARAM_DEFS[0]);
 
 const uint16_t EEPROM_MAGIC = 0xC3A2;
 
+// Codes are persisted in Header.runFlags; do not renumber existing codes.
+enum FaultCode : uint8_t { FAULT_NONE, FAULT_SENSOR, FAULT_OVERTEMP, FAULT_NO_HEAT };
+
 struct Header {
   uint16_t magic;
   Params p;
-  uint8_t running;
+  uint8_t runFlags;  // bit 0: running; bits 1..7: FaultCode (old 0/1 compatible)
   float startTemp;
 };
 
@@ -149,7 +162,7 @@ State phase = IDLE;
 bool running = false;       // a cure is in progress (possibly paused/faulted)
 bool paused = false;
 bool faulted = false;
-const __FlashStringHelper* faultReason = nullptr;
+FaultCode faultCode = FAULT_NONE;
 uint8_t sensorBadCount = 0;
 
 unsigned long cycleMs = 0;  // time into the cure cycle; only advances while running
@@ -206,19 +219,27 @@ float readTemperature() {
     return NAN;
   }
 
-  float V = 5.0 * lastAdc / 1024.0;
-  if (V >= Vcc) {             // shorted
+  if (lastAdc >= ADC_MAX - 1.0) {  // shorted / ADC at positive rail
     lastR = 0;
     return NAN;
   }
 
-  lastR = R2 * (Vcc - V) / V;
+  lastR = R2 * (ADC_MAX - lastAdc) / lastAdc;
   float lnR = log(lastR);
   return 1.0 / (A + B * lnR + C * lnR * lnR * lnR) - 273.15;
 }
 
 bool tempValid(float t) {
-  return !isnan(t) && t > SENSOR_MIN_C && t < SENSOR_MAX_C;
+  return isfinite(t) && t > SENSOR_MIN_C && t < SENSOR_MAX_C;
+}
+
+const __FlashStringHelper* faultName() {
+  switch (faultCode) {
+    case FAULT_SENSOR: return F("sensor");
+    case FAULT_OVERTEMP: return F("overtemp");
+    case FAULT_NO_HEAT: return F("no_heat");
+    default: return F("none");
+  }
 }
 
 void setHeater(bool on) {
@@ -236,7 +257,7 @@ void saveHeader() {
   Header h;
   h.magic = EEPROM_MAGIC;
   h.p = P;
-  h.running = running ? 1 : 0;
+  h.runFlags = (running ? 1 : 0) | ((uint8_t)faultCode << 1);
   h.startTemp = startTemp;
   EEPROM.put(HEADER_ADDR, h);
 }
@@ -267,6 +288,9 @@ bool loadFromEeprom() {
 
   P = h.p;
   startTemp = h.startTemp;
+  uint8_t savedFault = h.runFlags >> 1;
+  faultCode = savedFault <= FAULT_NO_HEAT ? (FaultCode)savedFault : FAULT_SENSOR;
+  faulted = faultCode != FAULT_NONE;
 
   progressSeq = 0;
   unsigned long savedMs = 0;
@@ -279,7 +303,7 @@ bool loadFromEeprom() {
     }
   }
 
-  if (h.running) {
+  if (h.runFlags & 1) {
     running = true;
     cycleMs = savedMs;
     return true;
@@ -379,6 +403,7 @@ void printData() {
   Serial1.print(F(" state="));        printState();
   Serial1.print(F(" paused="));       Serial1.print(paused ? 1 : 0);
   Serial1.print(F(" fault="));        Serial1.print(faulted ? 1 : 0);
+  Serial1.print(F(" reason="));       Serial1.print(faultName());
   Serial1.print(F(" temp="));         Serial1.print(currentTemp, 2);
   Serial1.print(F(" set="));          Serial1.print(setPoint, 2);
   Serial1.print(F(" err="));          Serial1.print(setPoint - currentTemp, 2);
@@ -400,13 +425,16 @@ void printHelp() {
 
 // ---------------- Run control ----------------
 
-void raiseFault(const __FlashStringHelper* reason) {
+void raiseFault(FaultCode code) {
   setHeater(false);
   if (!faulted) {
     faulted = true;
-    faultReason = reason;
+    faultCode = code;
+    heatWatch.reset(millis());
+    saveProgress();
+    saveHeader();                   // retain the latch across resets
     Serial1.print(F("EVENT fault reason="));
-    Serial1.print(reason);
+    Serial1.print(faultName());
     Serial1.print(F(" temp="));
     Serial1.println(currentTemp, 2);
   }
@@ -414,18 +442,27 @@ void raiseFault(const __FlashStringHelper* reason) {
 
 // Returns false (and changes nothing) if the start temperature can't be read.
 bool startRun(float atMin) {
-  float t = readTemperature();
-  if (atMin <= 0 || !running) {
-    if (!tempValid(t)) {
-      Serial1.println(F("ERR cannot start: thermistor reading invalid"));
-      return false;
-    }
-    startTemp = t;
+  if (faulted) {
+    Serial1.println(F("ERR fault latched: fix the cause and CLEAR before START/GOTO"));
+    return false;
   }
+  float t = readTemperature();
+  if (!tempValid(t)) {
+    Serial1.println(F("ERR cannot start: thermistor reading invalid"));
+    return false;
+  }
+  if (t > P.maxTemp) {
+    currentTemp = t;
+    raiseFault(FAULT_OVERTEMP);
+    Serial1.println(F("ERR cannot start: above over-temp cutoff"));
+    return false;
+  }
+  if (atMin <= 0 || !running) startTemp = t;
+  setHeater(false);
+  heatWatch.reset(millis());
   phase = IDLE;   // so the next update reports the phase we land in
   running = true;
   paused = false;
-  faulted = false;
   sensorBadCount = 0;
   vacuumSafe = false;
   vacuumSafeAnnounced = false;
@@ -495,10 +532,10 @@ void controlStep() {
   } else {
     currentTemp = t;
     if (sensorBadCount < 255) sensorBadCount++;
-    if (sensorBadCount >= SENSOR_FAULT_COUNT) raiseFault(F("sensor"));
+    if (sensorBadCount >= SENSOR_FAULT_COUNT) raiseFault(FAULT_SENSOR);
   }
 
-  if (tempValid(currentTemp) && currentTemp > P.maxTemp) raiseFault(F("overtemp"));
+  if (tempValid(currentTemp) && currentTemp > P.maxTemp) raiseFault(FAULT_OVERTEMP);
 
   updatePhase();
 
@@ -506,6 +543,17 @@ void controlStep() {
     controlHeating();
   } else {
     setHeater(false);
+  }
+
+  if (running && !faulted && phase != COMPLETE) {
+    // A valid, satisfied thermostat resets the window. Invalid reads turn the
+    // heater off above, but retain the exposure count if heating later resumes.
+    bool satisfied = tempValid(currentTemp) && !heaterOn;
+    if (heatWatch.update(millis(), heaterOn, tempValid(currentTemp) ? currentTemp : NAN, satisfied)) {
+      raiseFault(FAULT_NO_HEAT);
+    }
+  } else {
+    heatWatch.reset(millis());
   }
 
   vacuumSafe = (phase == COMPLETE && tempValid(currentTemp) && currentTemp <= VACUUM_SAFE_C);
@@ -525,7 +573,7 @@ bool parseFloat(const char* s, float& out) {
   if (!s) return false;
   char* end;
   out = strtod(s, &end);
-  return end != s && *end == '\0';
+  return end != s && *end == '\0' && isfinite(out);
 }
 
 void setParam(const char* name, const char* valueStr) {
@@ -602,8 +650,18 @@ void handleCommand(char* line) {
     abortRun();
     Serial1.println(F("OK abort"));
   } else if (strcasecmp(cmd, "CLEAR") == 0) {
+    if (!faulted) { Serial1.println(F("OK clear")); return; }
+    currentTemp = readTemperature();
+    if (!tempValid(currentTemp) || currentTemp > P.maxTemp) {
+      Serial1.println(F("ERR cannot clear: sensor invalid or above over-temp cutoff"));
+      return;
+    }
     faulted = false;
+    faultCode = FAULT_NONE;
     sensorBadCount = 0;
+    setHeater(false);
+    heatWatch.reset(millis());
+    saveHeader();
     Serial1.println(F("EVENT fault_cleared"));
     Serial1.println(F("OK clear"));
   } else if (strcasecmp(cmd, "SET") == 0) {
@@ -642,6 +700,8 @@ void setup() {
   setHeater(false);                 // heater off before anything else
 
   pinMode(thermistorPin, INPUT);
+  analogReference(AR_DEFAULT);
+  analogReadResolution(10);
   digitalWrite(TFT_CS, HIGH);
   pinMode(TFT_CS, OUTPUT);
 
@@ -655,10 +715,16 @@ void setup() {
   currentTemp = readTemperature();
   printParams();
 
+  if (faulted) {
+    Serial1.print(F("EVENT fault reason="));
+    Serial1.print(faultName());
+    Serial1.print(F(" temp="));
+    Serial1.println(currentTemp, 2);
+  }
   if (resume) {
-    Serial1.print(F("EVENT resumed t="));
+    Serial1.print(faulted ? F("INFO saved cure faulted t=") : F("EVENT resumed t="));
     Serial1.println(cycleMs / 1000.0, 1);
-  } else if (AUTO_START) {
+  } else if (AUTO_START && !faulted) {
     startRun(0);
   } else {
     Serial1.println(F("INFO idle, send START to begin a cure"));

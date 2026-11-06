@@ -58,8 +58,25 @@ DEFAULTS = {
     "ramp1": 38.0, "hold1temp": 120.0, "hold1": 240.0, "ramp2": 24.0,
     "hold2temp": 180.0, "hold2": 120.0, "hyst": 2.0, "maxtemp": 200.0,
 }
+PARAM_LIMITS = {
+    "ramp1": (0.0, 1440.0), "hold1temp": (0.0, 250.0), "hold1": (0.0, 1440.0),
+    "ramp2": (0.0, 1440.0), "hold2temp": (0.0, 250.0), "hold2": (0.0, 1440.0),
+    "hyst": (0.1, 20.0), "maxtemp": (50.0, 280.0),
+}
+# Match cure_controller.ino: B57550G1103F000, curve 8307, 2402 ohm divider.
+THERMISTOR_A = 0.000855501331
+THERMISTOR_B = 0.000259624005
+THERMISTOR_C = 0.000000137319048
+DIVIDER_R = 2402.0
+HEAT_RISE_TIMEOUT_S = 180.0
+HEAT_MIN_RISE_C = 2.0
+FAULT_HINTS = {
+    "sensor": "Check thermistor wiring and the A2 divider.",
+    "overtemp": "Above over-temp cutoff. Let the oven cool before clearing.",
+    "no_heat": "Insufficient temperature rise. Check sensor, heater and relay.",
+}
 CURING_STATES = ("RAMP1", "HOLD1", "RAMP2", "HOLD2")
-CSV_FIELDS = ["wallclock", "t", "state", "paused", "fault", "temp", "set", "err",
+CSV_FIELDS = ["wallclock", "t", "state", "paused", "fault", "reason", "temp", "set", "err",
               "heater", "st", "srem", "rem", "vac", "adc", "R", "up", "note"]
 
 # Palette
@@ -169,6 +186,9 @@ class SimLink:
         self.oven = self.AMBIENT
         self.temp = self.AMBIENT
         self.running = self.paused = self.fault = self.heater = False
+        self.fault_reason = "none"
+        self.sensor_bad_count = 0
+        self._reset_heat_watch()
         self.vac_announced = False
         self.phase = "IDLE"
         self.t = 0.0
@@ -224,20 +244,88 @@ class SimLink:
         name, _, a, b = self._phase_at(self.t)
         cur = self.running and self.phase != "COMPLETE"
         vac = self.phase == "COMPLETE" and self.temp <= 65
+        adc, resistance = self._sensor_raw()
         self._emit(
             f"DATA t={self.t:.1f} state={self.phase} paused={int(self.paused)} fault={int(self.fault)} "
+            f"reason={self.fault_reason} "
             f"temp={self.temp:.2f} set={self.setpoint:.2f} err={self.setpoint - self.temp:.2f} "
             f"heater={int(self.heater)} st={(self.t - a) if cur else 0:.0f} srem={(b - self.t) if cur else 0:.0f} "
-            f"rem={(self._total() - self.t) if cur else 0:.0f} vac={int(vac)} adc=0.0 R=0.0 up={int(self.up)}"
+            f"rem={(self._total() - self.t) if cur else 0:.0f} vac={int(vac)} "
+            f"adc={adc:.1f} R={resistance:.1f} up={int(self.up)}"
         )
 
     def _start(self, at_s):
+        if self.fault:
+            self._emit("ERR fault latched: fix the cause and CLEAR before START/GOTO")
+            return False
+        self.temp = self._read_sensor()
+        if not self._temp_valid(self.temp):
+            self._emit("ERR cannot start: thermistor reading invalid")
+            return False
+        if self.temp > self.p["maxtemp"]:
+            self._raise_fault("overtemp")
+            self._emit("ERR cannot start: above over-temp cutoff")
+            return False
         if at_s <= 0 or not self.running:
             self.start_temp = self.temp
-        self.running, self.paused, self.fault, self.vac_announced = True, False, False, False
+        self.running, self.paused, self.vac_announced = True, False, False
+        self.phase = "IDLE"
+        self.heater = False
+        self.sensor_bad_count = 0
+        self._reset_heat_watch()
         self.t = at_s
         self._emit(f"EVENT start t={self.t:.1f} start={self.start_temp:.2f}")
         self._emit_params()
+        return True
+
+    @staticmethod
+    def _temp_valid(temp):
+        return math.isfinite(temp) and -20.0 < temp < 300.0
+
+    def _sensor_raw(self):
+        if not self._temp_valid(self.temp):
+            return float("nan"), float("nan")
+        # Invert the same Steinhart-Hart equation used by the board.
+        inv_t = 1.0 / (self.temp + 273.15)
+        ln_r = math.log(10000.0)
+        for _ in range(8):
+            ln_r -= (THERMISTOR_A + THERMISTOR_B * ln_r + THERMISTOR_C * ln_r**3 - inv_t) / (
+                THERMISTOR_B + 3 * THERMISTOR_C * ln_r**2)
+        resistance = math.exp(ln_r)
+        return 1023.0 * DIVIDER_R / (DIVIDER_R + resistance), resistance
+
+    def _raise_fault(self, reason):
+        self.heater = False
+        if not self.fault:
+            self.fault = True
+            self.fault_reason = reason
+            self._reset_heat_watch()
+            self._emit(f"EVENT fault reason={reason} temp={self.temp:.2f}")
+
+    def _reset_heat_watch(self):
+        self.watch_active = False
+        self.watch_on_s = 0.0
+        self.watch_baseline = 0.0
+
+    def _watch_heat(self, h, was_heating):
+        if self.watch_active and was_heating:
+            self.watch_on_s += h
+        if self._temp_valid(self.temp) and not self.heater:
+            self._reset_heat_watch()
+        elif not self.watch_active:
+            if self.heater and self._temp_valid(self.temp):
+                self.watch_active = True
+                self.watch_baseline = self.temp
+                self.watch_on_s = 0.0
+        else:
+            if self._temp_valid(self.temp) and self.temp >= self.watch_baseline + HEAT_MIN_RISE_C:
+                self.watch_baseline = self.temp
+                self.watch_on_s = 0.0
+            if self.watch_on_s >= HEAT_RISE_TIMEOUT_S:
+                self._raise_fault("no_heat")
+
+    def _read_sensor(self):
+        return self.oven + random.gauss(0, 0.15)
 
     def _handle(self, line):
         parts = line.split()
@@ -246,16 +334,15 @@ class SimLink:
         cmd = parts[0].upper()
         args = parts[1:]
         if cmd == "START":
-            self.phase = "IDLE"
-            self._start(0)
-            self._emit("OK start")
+            if self._start(0):
+                self._emit("OK start")
         elif cmd == "GOTO":
             m = to_float(args[0] if args else None)
-            if math.isnan(m) or m < 0 or m * 60 > self._total():
+            if not math.isfinite(m) or m < 0 or m * 60 > self._total():
                 self._emit("ERR usage: GOTO <minutes>, within the cycle length")
                 return
-            self._start(m * 60)
-            self._emit(f"OK goto {m:.2f}")
+            if self._start(m * 60):
+                self._emit(f"OK goto {m:.2f}")
         elif cmd in ("PAUSE", "RESUME"):
             if not self.running:
                 self._emit("ERR not running")
@@ -266,18 +353,36 @@ class SimLink:
         elif cmd == "ABORT":
             self.running = self.paused = self.heater = False
             self.phase, self.setpoint = "IDLE", 0.0
+            self._reset_heat_watch()
             self._emit("EVENT abort")
             self._emit("OK abort")
         elif cmd == "CLEAR":
+            if not self.fault:
+                self._emit("OK clear")
+                return
+            self.temp = self._read_sensor()
+            if not self._temp_valid(self.temp) or self.temp > self.p["maxtemp"]:
+                self._emit("ERR cannot clear: sensor invalid or above over-temp cutoff")
+                return
             self.fault = False
+            self.fault_reason = "none"
+            self.sensor_bad_count = 0
+            self.heater = False
+            self._reset_heat_watch()
             self._emit("EVENT fault_cleared")
             self._emit("OK clear")
         elif cmd == "SET":
-            if len(args) != 2 or args[0].lower() not in self.p or math.isnan(to_float(args[1])):
+            if len(args) != 2 or args[0].lower() not in self.p or not math.isfinite(to_float(args[1])):
                 self._emit("ERR usage: SET <name> <value>")
+                return
+            low, high = PARAM_LIMITS[args[0].lower()]
+            if not low <= to_float(args[1]) <= high:
+                self._emit(f"ERR {args[0].lower()} must be between {low:.2f} and {high:.2f}")
                 return
             self.p[args[0].lower()] = to_float(args[1])
             self._emit(f"OK set {args[0].lower()}={to_float(args[1]):.2f}")
+            if self.p["maxtemp"] <= self.p["hold2temp"]:
+                self._emit("INFO warning: maxtemp is at or below hold2temp, cure will fault")
             self._emit_params()
         elif cmd == "DEFAULTS":
             self.p = dict(DEFAULTS)
@@ -294,6 +399,7 @@ class SimLink:
             self._emit(f"ERR unknown command: {parts[0]}")
 
     def _step(self, h):
+        was_heating = self.heater
         self.up += h
         if self.running and not self.paused and not self.fault:
             self.t += h
@@ -308,17 +414,26 @@ class SimLink:
                     self._emit("EVENT complete")
         else:
             self.setpoint = 0.0
-        self.temp = self.oven + random.gauss(0, 0.15)
-        if self.temp > self.p["maxtemp"] and not self.fault:
-            self.fault = True
-            self._emit(f"EVENT fault reason=overtemp temp={self.temp:.2f}")
-        if self.running and not self.fault and self.phase != "COMPLETE":
+        self.temp = self._read_sensor()
+        if self._temp_valid(self.temp):
+            self.sensor_bad_count = 0
+            if self.temp > self.p["maxtemp"]:
+                self._raise_fault("overtemp")
+        else:
+            self.sensor_bad_count += 1
+            if self.sensor_bad_count >= 3:
+                self._raise_fault("sensor")
+        if self.running and not self.fault and self.phase != "COMPLETE" and self._temp_valid(self.temp):
             if not self.heater and self.temp < self.setpoint - self.p["hyst"]:
                 self.heater = True
             elif self.heater and self.temp > self.setpoint + self.p["hyst"]:
                 self.heater = False
         else:
             self.heater = False
+        if self.running and not self.fault and self.phase != "COMPLETE":
+            self._watch_heat(h, was_heating)
+        else:
+            self._reset_heat_watch()
         if self.phase == "COMPLETE" and self.temp <= 65 and not self.vac_announced:
             self.vac_announced = True
             self._emit(f"EVENT vacuum_safe temp={self.temp:.2f}")
@@ -730,6 +845,10 @@ class CureGUI:
         state = f.get("state", "?")
         paused = f.get("paused") == "1"
         fault = f.get("fault") == "1"
+        # DATA carries the persisted reason, including after reconnecting when
+        # the original EVENT fault line may have been missed. Older boards work.
+        if "reason" in f:
+            self.fault_reason = f["reason"] if fault else ""
 
         # Plot while curing; after COMPLETE the cycle clock stops, so keep the
         # cool-down on the chart by advancing x with the board's uptime.
@@ -771,8 +890,7 @@ class CureGUI:
 
         if fault:
             reason = self.fault_reason or "unknown"
-            hint = {"sensor": "Check thermistor wiring.",
-                    "overtemp": "Above over-temp cutoff."}.get(reason, "")
+            hint = FAULT_HINTS.get(reason, "")
             self.fault_label.configure(text=f"FAULT ({reason}): heater off, clock frozen. {hint} "
                                             "Fix it, then Clear fault.")
             self.fault_label.grid()
@@ -831,7 +949,7 @@ class CureGUI:
 
     def cmd_goto(self):
         m = to_float(self.goto_var.get())
-        if math.isnan(m) or m < 0:
+        if not math.isfinite(m) or m < 0:
             messagebox.showerror("Jump to minute", "Enter the number of minutes into the cycle, e.g. 45.")
             return
         self.send(f"GOTO {m:g}")
@@ -856,7 +974,7 @@ class CureGUI:
 
     def cmd_send_params(self, confirm=True):
         changes = self._unsent_params()
-        bad = [k for k, v in changes.items() if math.isnan(v)]
+        bad = [k for k, v in changes.items() if not math.isfinite(v) or not PARAM_LIMITS[k][0] <= v <= PARAM_LIMITS[k][1]]
         if bad:
             messagebox.showerror("Invalid value", "Check these fields: " + ", ".join(bad))
             return
@@ -899,14 +1017,14 @@ class CureGUI:
         vals = {k: to_float(v.get()) for k, v in self.param_vars.items()}
         for key, ent in self.param_entries.items():
             v = vals[key]
-            if math.isnan(v):
+            if not math.isfinite(v) or not PARAM_LIMITS[key][0] <= v <= PARAM_LIMITS[key][1]:
                 ent.configure(bg="#FBE3E3")
             elif abs(v - self.loaded_params.get(key, v)) > 1e-6:
                 ent.configure(bg="#FFF3C4")   # edited, not yet sent
             else:
                 ent.configure(bg="white")
-        if any(math.isnan(v) for v in vals.values()):
-            self.param_hint.configure(text="Enter numbers in every field.")
+        if any(not math.isfinite(v) or not PARAM_LIMITS[k][0] <= v <= PARAM_LIMITS[k][1] for k, v in vals.items()):
+            self.param_hint.configure(text="Enter finite values within the firmware's allowed ranges.")
             return
         r1 = (vals["hold1temp"] - self.start_temp) / vals["ramp1"] if vals["ramp1"] > 0 else float("inf")
         r2 = (vals["hold2temp"] - vals["hold1temp"]) / vals["ramp2"] if vals["ramp2"] > 0 else float("inf")

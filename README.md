@@ -69,7 +69,7 @@ The apps are not code-signed, so the first launch shows a warning:
 
 | Item | Pin |
 |---|---|
-| Thermistor divider output | A0 |
+| Thermistor divider output | A2 |
 | Heater relay | D2 (HIGH = heater on) |
 | TFT (ILI9341, 240x320, SPI) | CS D10, DC D9, RST D8, MOSI D11, SCK D13, MISO D12 (optional), plus VCC, GND and LED/backlight |
 | Serial link to computer | **Serial1: D0 (RX), D1 (TX), 115200 baud** |
@@ -126,20 +126,25 @@ sensor fault has latched).
 
 ### Temperature measurement
 
-Each reading averages **8 ADC samples** on A0, then converts with the original
-divider and Steinhart-Hart constants:
+Each reading averages **8 ADC samples** on A2 with an explicitly configured 10-bit
+ADC. The thermistor is **B57550G1103F000**, 10 kΩ at 25 °C, characteristic **8307**
+(B25/100 = 3492 K), from the [TDK datasheet](https://product.tdk.com/system/files/dam/doc/product/sensor/ntc/ntc_element/data_sheet/50/db/ntc/ntc_glass_enc_sensors_g1550.pdf).
+The Steinhart-Hart coefficients are fitted to its 25, 120 and 200 °C table points.
+Other B57550 variants require different coefficients.
+
+Wire the divider as `5 V -> NTC -> A2 -> 2402 Ω -> GND`. The ADC reference must
+use the same supply as the divider, so the supply voltage cancels:
 
 ```
-V = 5.0 * adc / 1024
-R = R2 * (Vcc - V) / V          R2 = 2402 ohm, Vcc = 5.061 V
-1/T = A + B ln(R) + C ln(R)^3   A = 4.5421e-4, B = 3.5529e-4, C = -2.7612e-7
+R = 2402 * (1023 - adc) / adc   R in ohms
+1/T = A + B ln(R) + C ln(R)^3   T in kelvin
+A = 8.55501331e-4, B = 2.59624005e-4, C = 1.37319048e-7
 ```
 
-**Calibration note (unchanged from the original, worth checking):** the ADC counts
-are converted with 5.0 V while the divider math uses Vcc = 5.061 V. If the ADC
-reference is the 5 V rail (the R4 default), this mismatch makes the reading roughly
-10 to 12 °C low near 180 °C, unless A, B and C were fitted using this same formula.
-Verify against a thermocouple at the 180 °C hold before trusting the numbers.
+This removes the original 5.0 V / 5.061 V mismatch. `R2` remains the measured
+**fixed resistor**, not the thermistor's 10 kΩ nominal resistance. Verify readings
+against a thermocouple at ambient and both holds; resistor tolerance, lead
+resistance, probe installation and self-heating still affect the result.
 
 ### Cycle clock
 
@@ -151,9 +156,10 @@ remaining time is added on when it continues.
 
 The board stores its state in EEPROM (flash-emulated on the R4):
 
-- **Parameters, start temperature, and whether a cure is running** are saved whenever
-  they change (START, GOTO, SET, DEFAULTS, ABORT, COMPLETE).
-- **Cycle clock** is saved every 30 s and on PAUSE, rotated across 32 slots to spread
+- **Parameters, start temperature, run status, and latched fault reason** are saved
+  when they change. Faults and CLEAR update the header as well as the run commands.
+  The layout remains compatible with previously saved parameters and runs.
+- **Cycle clock** is saved every 30 s, on PAUSE and on a new fault, rotated across 32 slots to spread
   flash wear.
 
 At power-up:
@@ -161,6 +167,8 @@ At power-up:
 - If a cure was running, the board **resumes it automatically** from the last saved
   clock position (up to 30 s earlier than where it stopped) and prints
   `EVENT resumed t=...`.
+- If a fault was latched, it restores the fault and saved clock with the heater
+  off. It requires CLEAR before continuing, including with `AUTO_START` enabled.
 - Otherwise it waits in IDLE for a START command (see `AUTO_START` below).
 
 ### Vacuum
@@ -176,44 +184,53 @@ release vacuum.
 
 A fault **latches**: the heater turns off, the cycle clock freezes, the TFT shows
 **FAULT** in red, the board prints `EVENT fault reason=... temp=...`, every `DATA`
-line has `fault=1`, and the GUI shows a red banner. It stays latched until you send
+line has `fault=1 reason=...`, and the GUI shows a red banner. It stays latched until you send
 **CLEAR** (GUI: Clear fault).
 
 | Fault | Trigger | Typical causes |
 |---|---|---|
-| `sensor` | Temperature reading invalid for **3 readings in a row** (about 3 s). Invalid means: ADC reads about 0 (open circuit), the math gives NaN or infinity, or the result is below **-20 °C** or above **300 °C**. The heater is already off from the first bad reading. | Thermistor unplugged or broken wire, shorted thermistor, loose A0 connection, missing R2 |
+| `sensor` | Temperature reading invalid for **3 readings in a row** (about 3 s). Invalid means: ADC near either rail, a non-finite result, or temperature outside **-20 to 300 °C**. The heater is already off from the first bad reading. | Thermistor unplugged or broken wire, shorted thermistor, loose A2 connection, missing R2 |
 | `overtemp` | A valid reading above the **over-temp cutoff** (`maxtemp`, default **200 °C**). Immediate, no delay. | Relay stuck or slow to release, hysteresis too large, cutoff set too close to hold 2 temp, oven overshoot |
+| `no_heat` | Less than **2 °C rise in 180 s of commanded heater-on time** since heating began or the last qualifying rise. | Stuck-low or displaced sensor, failed heater/relay, inadequate heating for the load |
+
+The rise watchdog applies during ramps, holds and PAUSE. A normal thermostat-off
+reading resets it. Brief invalid readings turn the heater off but retain the
+accumulated exposure, so intermittent sensor faults cannot repeatedly restart the
+window. Falling or oscillating temperatures do not lower the rise baseline.
+`HEAT_RISE_TIMEOUT_MS` and `HEAT_MIN_RISE_C` in the sketch are initial thresholds;
+validate them with the slowest intended oven/load. Keep the simulator constants in
+sync if changing them (the tests check this).
 
 **Clearing a fault:**
 
 1. Fix the cause.
-2. Send CLEAR. The cure continues from exactly where the clock froze.
-3. If the cause is still present, it faults again: overtemp within 1 s, sensor after
-   3 bad readings.
+2. Send CLEAR. It requires a fresh valid sensor reading at or below `maxtemp`.
+   The cure then continues from where the clock froze, with a new rise window.
+3. A plausible stuck-low reading can pass CLEAR; repair the cause first or the
+   watchdog will fault again after another window of heating.
 
 Because the clock was frozen, a fault during a hold does **not** eat into hold time,
 but the part cools while the heater is off. Decide whether the cure is still valid
 before clearing.
 
-**Other ways a fault is cleared** (be aware of these):
+**Faults survive other commands and resets:**
 
-- `START` and `GOTO` also clear a fault (and a pause) when they run.
-- A board **reset or power cycle clears the latch** (the fault itself is not saved to
-  EEPROM). If a cure was running, it resumes; if the cause is still present it will
-  fault again within a few seconds.
+- `START` and `GOTO` reject a latched fault; send CLEAR after fixing the cause.
+- ABORT stops the run but retains the fault. DEFAULTS and SET also retain it.
+- A reset or power cycle restores the saved fault reason and keeps the heater off.
 
 **What the software cannot detect** (use independent hardware protection):
 
-- **Thermistor displaced but still connected** (fell off the part, reading room air):
-  it reads low and valid, so the heater stays on. There is no "heater on but
-  temperature not rising" check.
+- **Incorrect but rising sensor readings:** the rise watchdog detects inadequate
+  response, but cannot prove the probe is correctly located or calibrated. A
+  displaced probe that warms fast enough can still pass the check.
 - **Relay welded shut:** software turns the pin off but the heater stays powered.
   Overtemp will latch, but cannot cut power.
 - **Board freeze:** there is no watchdog; a hung board leaves the relay in its last
   state.
 
-A thermal fuse or snap-disc thermostat in series with the heater, rated just above
-the highest cure temperature, covers all three.
+Use an independent thermal fuse or high-limit thermostat in series with the heater
+to cut power when the controller cannot.
 
 ---
 
@@ -226,7 +243,7 @@ with a tag.
 
 | Tag | When | Example |
 |---|---|---|
-| `DATA` | every second, and on STATUS | `DATA t=61.0 state=RAMP1 paused=0 fault=0 temp=25.10 set=26.44 err=1.34 heater=1 st=61 srem=2219 rem=25259 vac=0 adc=301.5 R=5876.2 up=64` |
+| `DATA` | every second, and on STATUS | `DATA t=61.0 state=RAMP1 paused=0 fault=0 reason=none temp=25.10 set=26.44 err=1.34 heater=1 st=61 srem=2219 rem=25259 vac=0 adc=198.8 R=9961.9 up=64` |
 | `PARAMS` | at boot, on PARAMS, after SET, DEFAULTS, START, GOTO | `PARAMS ramp1=38.00 hold1temp=120.00 hold1=240.00 ramp2=24.00 hold2temp=180.00 hold2=120.00 hyst=2.00 maxtemp=200.00 start=23.41 total=422.00` |
 | `EVENT` | something happened | `EVENT state from=RAMP1 to=HOLD1 t=2280.0` |
 | `OK` / `ERR` | reply to a command | `OK set hold1=250.00`, `ERR not running` |
@@ -239,6 +256,7 @@ with a tag.
 | `t` | cycle clock, seconds |
 | `state` | IDLE, RAMP1, HOLD1, RAMP2, HOLD2, COMPLETE |
 | `paused`, `fault` | 1 if paused / fault latched |
+| `reason` | `none`, `sensor`, `overtemp`, or `no_heat`; repeated for reconnects and CSV logging |
 | `temp` | temperature, °C (`nan` if invalid) |
 | `set` | setpoint, °C (0 when not running) |
 | `err` | setpoint minus temperature (positive = oven below setpoint) |
@@ -260,12 +278,12 @@ Case-insensitive. Also usable from any serial terminal on the adapter's port
 
 | Command | Effect |
 |---|---|
-| `START` | Start a new cure at t = 0. Measures the start temperature; if the thermistor reading is invalid it replies `ERR cannot start...` and changes nothing. Clears pause and fault. |
-| `GOTO <min>` | Jump to that minute of the cycle (0 to total length). If no cure is running, it starts one there and measures the start temperature. Clears pause and fault. Replaces the old `flashTime`. |
+| `START` | Start a new cure at t = 0. Requires no latched fault and a fresh valid reading at or below `maxtemp`. Clears pause. |
+| `GOTO <min>` | Jump to that minute of the cycle (0 to total length). Has the same fault and sensor checks as START. If no cure is running, it starts one there and measures the start temperature. Clears pause. Replaces the old `flashTime`. |
 | `PAUSE` | Freeze the cycle clock. The heater **keeps holding the current setpoint** (during a ramp, that is the temperature reached so far). |
 | `RESUME` | Unfreeze the clock. |
 | `ABORT` | Heater off, cure ends, back to IDLE. Cannot be resumed; use START or GOTO. |
-| `CLEAR` | Clear a latched fault. |
+| `CLEAR` | Clear and save the fault latch only with a fresh valid reading at or below `maxtemp`. |
 | `SET <name> <value>` | Change a parameter (below). Saved to EEPROM, takes effect **immediately, even mid-cure**. |
 | `DEFAULTS` | Restore the Toray 3960 defaults and save them. |
 | `PARAMS` | Print parameters. |
@@ -323,7 +341,9 @@ Things to know about changing parameters:
   column.
 - **Simulator:** choose "Simulator (no hardware)" in the port list or start with
   `--sim`. It imitates the firmware's commands and output at 60x speed with a simple
-  oven model, for trying the GUI safely.
+  oven model, including sensor/overtemp/no-rise faults, parameter limits, and the
+  B57550G1103F000 resistance and ADC conversion. A new simulator connection starts
+  fresh; it does not emulate persistent EEPROM storage.
 
 ### Choosing the port
 
@@ -389,9 +409,10 @@ see INFO/PARAMS/DATA lines within a second or two.
 
 ### Unchanged
 
-Pins, screen resolution and rotation, thermistor constants and conversion formula (including
-the 5.0 V vs 5.061 V note above), default Toray 3960 profile values, hysteresis
-control logic, 1 s control period, and 115200 baud.
+Screen resolution and rotation, relay/display/serial pins, default Toray 3960
+profile values, hysteresis control logic, 1 s control period, and 115200 baud.
+The thermistor now uses A2, B57550G1103F000 coefficients and the shared-supply
+divider conversion described above. Faults now persist and include a rise watchdog.
 
 ---
 
