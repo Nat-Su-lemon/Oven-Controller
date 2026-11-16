@@ -67,11 +67,15 @@ PARAM_LIMITS = {
     "hyst": (0.1, 20.0), "maxtemp": (50.0, 280.0),
     "heattimeout": (10.0, 1800.0), "heatrise": (0.1, 20.0),
 }
-# Match cure_controller.ino: B57550G1103F000, curve 8307, 2402 ohm divider.
+# Match cure_controller.ino: B57550G1103F000, curve 8307, 3020 ohm bottom resistor,
+# 3.3 V divider supply read against the 5 V ADC reference.
 THERMISTOR_A = 0.000855501331
 THERMISTOR_B = 0.000259624005
 THERMISTOR_C = 0.000000137319048
-DIVIDER_R = 2402.0
+DIVIDER_R = 3020.0
+DIVIDER_V = 3.3
+ADC_REF_V = 5.0
+ADC_TOP = 1023.0 * DIVIDER_V / ADC_REF_V
 FAULT_HINTS = {
     "sensor": "Check thermistor wiring and the A2 divider.",
     "overtemp": "Above over-temp cutoff. Let the oven cool before clearing.",
@@ -294,7 +298,7 @@ class SimLink:
             ln_r -= (THERMISTOR_A + THERMISTOR_B * ln_r + THERMISTOR_C * ln_r**3 - inv_t) / (
                 THERMISTOR_B + 3 * THERMISTOR_C * ln_r**2)
         resistance = math.exp(ln_r)
-        return 1023.0 * DIVIDER_R / (DIVIDER_R + resistance), resistance
+        return ADC_TOP * DIVIDER_R / (DIVIDER_R + resistance), resistance
 
     def _raise_fault(self, reason):
         self.heater = False

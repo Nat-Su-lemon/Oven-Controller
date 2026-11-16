@@ -4,7 +4,10 @@
 #include <iostream>
 
 uint32_t fakeMillis = 0;
-int fakeAdc = 198;
+// ADC count for an NTC resistance with the sketch's divider settings.
+static int adcForOhms(float r) { return (int)std::round(ADC_TOP * R2 / (R2 + r)); }
+
+int fakeAdc = adcForOhms(10000); // 25 C
 bool relayOutput = false;
 FakeSerial Serial1;
 FakeEeprom EEPROM;
@@ -17,7 +20,7 @@ static void command(const char* text) {
 
 static void fresh() {
   fakeMillis = 0;
-  fakeAdc = 198;
+  fakeAdc = adcForOhms(10000); // 25 C
   EEPROM = FakeEeprom();
   Serial1.output.str("");
   P = DEFAULT_PARAMS;
@@ -40,11 +43,12 @@ static void temperatureCurve() {
   const float temps[] = {0, 25, 65, 120, 180, 200, 250};
   const float resistances[] = {28024, 10000, 2539.2f, 581.44f, 169.61f, 119.99f, 56.316f};
   for (unsigned int i = 0; i < 7; ++i) {
-    fakeAdc = (int)std::round(1023 * R2 / (R2 + resistances[i]));
-    // The original 2402 ohm divider has coarser resolution near 250 C.
+    fakeAdc = adcForOhms(resistances[i]);
+    // The 3.3 V divider uses only ~2/3 of the 5 V ADC range: coarser near 250 C.
     assert(std::fabs(readTemperature() - temps[i]) < (temps[i] > 200 ? 2.0f : 1.1f));
   }
   fakeAdc = 0; assert(std::isnan(readTemperature()));
+  fakeAdc = (int)ADC_TOP; assert(std::isnan(readTemperature()));  // shorted NTC
   fakeAdc = 1023; assert(std::isnan(readTemperature()));
 }
 
@@ -91,15 +95,15 @@ static void invalidSensorAndOvertemp() {
   assert(faulted && faultCode == FAULT_SENSOR);
   command("CLEAR");
   assert(faulted);
-  fakeAdc = 198;
+  fakeAdc = adcForOhms(10000); // 25 C
   command("CLEAR");
   assert(!faulted);
-  fakeAdc = 990; // about 230 C: valid sensor, above maxTemp
+  fakeAdc = adcForOhms(74.93f); // 230 C: valid sensor, above maxTemp
   seconds(1);
   assert(faulted && faultCode == FAULT_OVERTEMP && !relayOutput);
   command("CLEAR");
   assert(faulted);
-  fakeAdc = 198;
+  fakeAdc = adcForOhms(10000); // 25 C
   command("CLEAR");
   assert(!faulted);
   float original = P.maxTemp;
@@ -209,7 +213,7 @@ static void adjustableWatchdog() {
     command(requiredRise == 1 ? "SET heatrise 1" : "SET heatrise 3");
     assert(startRun(38));
     seconds(1);
-    fakeAdc = 215; // about 27.5 C: enough for a 1 C rise, insufficient for 3 C
+    fakeAdc = adcForOhms(9027); // about 27.5 C: enough for a 1 C rise, insufficient for 3 C
     seconds(10);
     assert(faulted == (requiredRise == 3));
   }

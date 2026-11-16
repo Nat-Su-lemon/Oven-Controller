@@ -132,16 +132,23 @@ ADC. The thermistor is **B57550G1103F000**, 10 kΩ at 25 °C, characteristic **8
 The Steinhart-Hart coefficients are fitted to its 25, 120 and 200 °C table points.
 Other B57550 variants require different coefficients.
 
-Wire the divider as `5 V -> NTC -> A2 -> 2402 Ω -> GND`. The ADC reference must
-use the same supply as the divider, so the supply voltage cancels:
+The divider is `3.3 V -> NTC -> A2 -> 3020 Ω (R2, bottom) -> GND`. The ADC
+measures against the board's 5 V rail (`AR_DEFAULT`), so the divider supply
+does **not** cancel and the firmware scales by both voltages:
 
 ```
-R = 2402 * (1023 - adc) / adc   R in ohms
+ADC_TOP = 1023 * DIVIDER_V / ADC_REF_V          (3.3 V / 5.0 V -> 675.2)
+R = 3020 * (ADC_TOP - adc) / adc   R in ohms
 1/T = A + B ln(R) + C ln(R)^3   T in kelvin
 A = 8.55501331e-4, B = 2.59624005e-4, C = 1.37319048e-7
 ```
 
-This removes the original 5.0 V / 5.061 V mismatch. `R2` remains the measured
+Measure the 3.3 V and 5 V pins with a multimeter on the actual power source (USB
+vs. barrel jack differ) and set `DIVIDER_V` / `ADC_REF_V` in the sketch and in
+`app/cure_gui.py`. The result is sensitive to `ADC_REF_V`: a true 120 °C reads
+about 136 °C if the 5 V rail is 4.75 V, and about 109 °C at 5.25 V. Jumpering
+3.3 V to AREF with `analogReference(AR_EXTERNAL)` and `ADC_TOP = ADC_MAX` would make
+it ratiometric and remove that error. `R2` remains the measured
 **fixed resistor**, not the thermistor's 10 kΩ nominal resistance. Verify readings
 against a thermocouple at ambient and both holds; resistor tolerance, lead
 resistance, probe installation and self-heating still affect the result.

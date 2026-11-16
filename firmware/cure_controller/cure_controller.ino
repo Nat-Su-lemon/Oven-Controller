@@ -60,12 +60,18 @@ const int relayPin = 2;
 
 // B57550G1103F000: R25 = 10 kohm, R/T curve 8307 (B25/100 = 3492 K).
 // Steinhart-Hart fit to datasheet points at 25, 120 and 200 C, R in ohms.
-// Divider: 5 V -> NTC -> A2 -> R2 -> GND; ADC reference is the same 5 V rail.
-const float R2 = 2402.0;              // measured fixed resistor, not NTC R25
+// Divider: 3.3 V -> NTC -> A2 -> R2 (bottom) -> GND.
+// The ADC reference is the board's 5 V rail (AR_DEFAULT), not the divider
+// supply, so the reading is not ratiometric: set both voltages to multimeter
+// readings. A 5% error in ADC_REF_V shifts a true 120 C by roughly 12-16 C.
+const float R2 = 3020.0;              // measured fixed resistor, not NTC R25
 const float A = 0.000855501331;
 const float B = 0.000259624005;
 const float C = 0.000000137319048;
 const float ADC_MAX = 1023.0;         // explicitly configured 10-bit ADC
+const float DIVIDER_V = 3.3;          // measured: divider top (3.3V pin) to GND
+const float ADC_REF_V = 5.0;          // measured: 5V pin to GND
+const float ADC_TOP = ADC_MAX * DIVIDER_V / ADC_REF_V;  // counts at the divider top
 const uint8_t ADC_SAMPLES = 8;          // readings averaged per measurement
 
 // ---------------- Safety ----------------
@@ -232,12 +238,12 @@ float readTemperature() {
     return NAN;
   }
 
-  if (lastAdc >= ADC_MAX - 1.0) {  // shorted / ADC at positive rail
+  if (lastAdc >= ADC_TOP - 1.0) {  // shorted NTC / A2 at the divider supply
     lastR = 0;
     return NAN;
   }
 
-  lastR = R2 * (ADC_MAX - lastAdc) / lastAdc;
+  lastR = R2 * (ADC_TOP - lastAdc) / lastAdc;
   float lnR = log(lastR);
   return 1.0 / (A + B * lnR + C * lnR * lnR * lnR) - 273.15;
 }

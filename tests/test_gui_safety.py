@@ -52,7 +52,8 @@ class SimulatorSafetyTests(unittest.TestCase):
         self.assertEqual(fields["reason"], "no_heat")
         self.assertEqual(fields["heater"], "0")
         self.assertAlmostEqual(float(fields["R"]), 10000, delta=1)
-        self.assertGreater(float(fields["adc"]), 190)
+        self.assertAlmostEqual(float(fields["adc"]),
+                               gui.ADC_TOP * gui.DIVIDER_R / (gui.DIVIDER_R + 10000), delta=0.2)
         self.sim.write_line("CLEAR")
         self.assertFalse(self.sim.fault)
         self.assertEqual(self.sim.fault_reason, "none")
@@ -120,7 +121,8 @@ class SimulatorSafetyTests(unittest.TestCase):
     def test_constants_match_sketch(self):
         source = (Path(__file__).resolve().parents[1] / "firmware/cure_controller/cure_controller.ino").read_text()
         for name, value in [("A", gui.THERMISTOR_A), ("B", gui.THERMISTOR_B), ("C", gui.THERMISTOR_C),
-                            ("R2", gui.DIVIDER_R)]:
+                            ("R2", gui.DIVIDER_R), ("DIVIDER_V", gui.DIVIDER_V),
+                            ("ADC_REF_V", gui.ADC_REF_V)]:
             match = re.search(rf"const (?:float|uint32_t) {name} = ([\d.]+)", source)
             self.assertIsNotNone(match, name)
             self.assertEqual(float(match[1]), value, name)
